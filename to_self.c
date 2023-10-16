@@ -20,6 +20,7 @@
 
 #include <sys/mman.h>
 #include <zlib.h>
+//#include <lzo/lzo1x.h>
 
 #define MIN_LENGTH 1024
 #define MAX_LENGTH (1024 * 1024)
@@ -212,19 +213,32 @@ static int decompress_buffer(const unsigned char *input_buffer, size_t input_siz
 	return Z_OK;
 }
 
+#if 0
+static int compress_lzo_buffer(const unsigned char *input_buffer, size_t input_size, unsigned char **output_buffer, size_t *output_size) {
+
+    if (lzo_init() != LZO_E_OK) {
+            fprintf(stderr, "LZO initialization failed\n");
+                exit(1);
+    }
+
+
+
+}
+#endif
+
 static int send_rank_orig( int cycles, MPI_Datatype sddt, void *sbuf, void* rbuf )
 {
-	int outsize, do_size, done;
-	double timers[trials];
+    int outsize, do_size, done;
+    double timers[trials];
 
-	MPI_Type_size(sddt, &outsize);
+    MPI_Type_size(sddt, &outsize);
 
-	int c = 0;
-	for( int t = 0; t < trials; t++ ){
-	//	if( t == 0 )
-	//		printf("reference_buffer_size %zu ", outsize);
-		
-		timers[t] = MPI_Wtime();
+    int c = 0;
+    for( int t = 0; t < trials; t++ ){
+        //	if( t == 0 )
+        //		printf("reference_buffer_size %zu ", outsize);
+
+        timers[t] = MPI_Wtime();
 		for( c = 0; c < cycles; c++ ){
 			MPI_Send(sbuf, 1, sddt, 1, t*4 + c, MPI_COMM_WORLD);
 			MPI_Recv( rbuf, 1, sddt, 1, t*4+c+1, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
@@ -588,6 +602,63 @@ static void do_compression_test_only( int cycles, MPI_Datatype sddt, void *sbuf,
     print_result(ddt_size, trials, decomp_time);
 }
 
+#if 0
+static void do_lzo_compression_test_only( int cycles, MPI_Datatype sddt, void *sbuf, char *scomp,
+        void *rbuf, char *rcomp, int length )
+{
+
+    double comp_time[trials], decomp_time[trials];
+
+    int ddt_size;
+    MPI_Type_size( sddt, &ddt_size );
+
+    FILE *fptr = fopen("data_file", "wb");
+    fwrite( sbuf, ddt_size, 1, fptr );
+    fseek( fptr, 0L, SEEK_END );
+    size_t sz = ftell( fptr );
+    fclose(fptr);
+
+    memset( sbuf, 0, (size_t)ddt_size );
+    int *ptr = mmap( NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0 );
+    if(ptr == MAP_FAILED){
+        printf("Mapping Failed\n");
+        return 1;
+    }
+
+    fptr = fopen("data_file", "r");
+    if( fptr == NULL ){
+        printf("Error ! opening file\n");
+        exit(0);
+    }
+
+    fread( sbuf, ddt_size, 1, fptr );
+    fclose( fptr );
+
+    size_t scomp_len = (size_t)ddt_size;
+    for( int t = 0; t < trials; t++ ){
+        comp_time[t] = MPI_Wtime();
+        scomp_len = (size_t)ddt_size;
+        for( int c = 0; c < cycles; c++ ){
+            compress_lzo_buffer((unsigned char*)sbuf, ddt_size, (unsigned char**)&scomp, &scomp_len);
+        }
+        comp_time[t] = (MPI_Wtime() - comp_time[t]) / cycles;
+    }
+
+    size_t compressed_size = scomp_len, decomp_len;
+    for( int t = 0; t < trials; t++ ){
+        decomp_time[t] = MPI_Wtime();
+        scomp_len = (size_t)ddt_size;
+        for( int c = 0; c < cycles; c++ ){
+            decomp_len = length * 2;
+            decompress_buffer(scomp, compressed_size, (unsigned char**)&rcomp, &decomp_len);
+        }
+        decomp_time[t] = (MPI_Wtime() - decomp_time[t]) / cycles;
+    }
+//    print_result(ddt_size, trials, comp_time);
+//    print_result(ddt_size, trials, decomp_time);
+}
+#endif
+
 static int do_test_for_ddt(int doop, MPI_Datatype sddt, MPI_Datatype rddt, int length)
 {
     MPI_Aint lb, extent;
@@ -636,6 +707,7 @@ static int do_test_for_ddt(int doop, MPI_Datatype sddt, MPI_Datatype rddt, int l
 
     if( size == 1 ){
         do_compression_test_only( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
+//        do_lzo_compression_test_only( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
     }
 
     free( scomp );
