@@ -20,13 +20,14 @@
 
 #include <sys/mman.h>
 #include <zlib.h>
-//#include <lzo/lzo1x.h>
+#include <lzo/lzo1x.h>
+#include <lz4.h>
 
 #define MIN_LENGTH 1024
 #define MAX_LENGTH (1024 * 1024)
 
 static int cycles = 10;
-static int trials = 10;
+static int trials = 100;
 static int warmups = 1;
 
 static void print_result(int length, int trials, double *timers)
@@ -137,8 +138,7 @@ static int unpack(int cycles, void *packed_buf, MPI_Datatype rdt, int rcount, vo
     return 0;
 }
 
-//#define COMPRESSION_LEVEL Z_DEFAULT_COMPRESSION
-#define COMPRESSION_LEVEL 9
+#define COMPRESSION_LEVEL Z_DEFAULT_COMPRESSION
 
 static int compress_buffer(const unsigned char *input_buffer, size_t input_size, unsigned char **output_buffer, size_t *output_size) {
 
@@ -213,7 +213,6 @@ static int decompress_buffer(const unsigned char *input_buffer, size_t input_siz
 	return Z_OK;
 }
 
-#if 0
 static int compress_lzo_buffer(const unsigned char *input_buffer, size_t input_size, unsigned char **output_buffer, size_t *output_size) {
 
     if (lzo_init() != LZO_E_OK) {
@@ -221,10 +220,86 @@ static int compress_lzo_buffer(const unsigned char *input_buffer, size_t input_s
                 exit(1);
     }
 
+    lzo_voidp wrkmem = (lzo_voidp) malloc(LZO1X_1_MEM_COMPRESS);
 
+    int result = lzo1x_1_compress(
+                (const lzo_bytep)input_buffer, input_size,
+                    (lzo_bytep)*output_buffer, (lzo_uintp)output_size, wrkmem
+            );
+
+    if (result != LZO_E_OK) {
+            fprintf(stderr, "Compression failed with error code %d\n", result);
+                exit(1);
+    }
+
+    free( wrkmem );
 
 }
-#endif
+
+static int decompress_lzo_buffer(const unsigned char *input_buffer, size_t input_size, 
+        unsigned char **output_buffer, size_t *output_size) {
+
+    if (lzo_init() != LZO_E_OK) {
+        fprintf(stderr, "LZO initialization failed\n");
+        exit(1);
+    }
+
+    lzo_voidp wrkmem = (lzo_voidp) malloc(LZO1X_1_MEM_COMPRESS);
+
+    int result = lzo1x_decompress(
+            (const lzo_bytep)input_buffer, input_size,
+            (lzo_bytep)*output_buffer, (lzo_uintp)output_size, wrkmem
+            );
+
+    if (result != LZO_E_OK) {
+        fprintf(stderr, "Decompression failed with error code %d\n", result);
+        exit(1);
+    }
+
+    free( wrkmem );
+}
+
+
+static int compress_lz4_buffer(const unsigned char *input_buffer, size_t input_size, 
+        unsigned char **output_buffer, size_t *output_size) {
+    *output_size = (int)( LZ4_compress(input_buffer, *output_buffer, input_size) );
+    //LZ4_compress_default( input_buffer, *output_buffer, input_size, *output_size );
+
+//    int maxCompressedSize = LZ4_compressBound(input_size); 
+//    int compressedSize = LZ4_compress_HC(input_buffer, *output_buffer, input_size, maxCompressedSize, LZ4HC_CLEVEL_MAX);
+
+//    printf("input %zu output %zu\n",
+  //          input_size, *output_size );
+}
+
+static int decompress_lz4_buffer(const unsigned char *input_buffer, size_t input_size, 
+                unsigned char **output_buffer, size_t *output_size) {
+    *output_size = (int)( LZ4_decompress_fast(input_buffer, *output_buffer, input_size) );
+}
+
+static int which_compression( const unsigned char *input_buffer, size_t input_size, 
+        unsigned char **output_buffer, size_t *output_size, int comp_num ){
+    switch( comp_num ){
+        case 0:
+            return compress_buffer(input_buffer, input_size, output_buffer, output_size);
+        case 1:
+            return compress_lzo_buffer(input_buffer, input_size, output_buffer, output_size);
+        case 2:
+            return compress_lz4_buffer(input_buffer, input_size, output_buffer, output_size);
+    }
+}
+
+static int which_decompression( const unsigned char *input_buffer, size_t input_size, 
+        unsigned char **output_buffer, size_t *output_size, int comp_num) {
+    switch( comp_num ){
+        case 0:
+            return decompress_buffer(input_buffer, input_size, output_buffer, output_size);
+        case 1:
+            return decompress_lzo_buffer(input_buffer, input_size, output_buffer, output_size);
+        case 2:
+            return decompress_lz4_buffer(input_buffer, input_size, output_buffer, output_size);
+    }
+}
 
 static int send_rank_orig( int cycles, MPI_Datatype sddt, void *sbuf, void* rbuf )
 {
@@ -379,9 +454,7 @@ static int send_rank_timing( int cycles, MPI_Datatype sddt, void *sbuf, char *sc
 
         MPI_Recv( &compressed_size, 1, MPI_LONG, 1, t*4+c+2, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
 
-//        timer_keep = MPI_Wtime();
         MPI_Recv( rbuf, compressed_size, MPI_BYTE, 1, t*4+c+3, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
-//        timers[t] += MPI_Wtime() - timer_keep;
         
         decomp_time[t] = MPI_Wtime();
         result = decompress_buffer(rbuf, compressed_size, (unsigned char**)&rcomp, &dcomp_len);
@@ -433,30 +506,136 @@ static int recv_rank_timing( int cycles, MPI_Datatype sddt, void *sbuf, char *sc
     return 0;
 }
 
-static int send_rank_compress_done( int cycles, MPI_Datatype sddt, void *sbuf, char *scomp, 
-		      void* rbuf, char *rcomp, int length )
-{
-	int outsize, do_size, done;
-	double timers[trials], comp_time[trials], decomp_time[trials];
 
-	MPI_Type_size(sddt, &outsize);
-       
-	size_t compressed_size, decompressed_size;
-	int result;
+static int send_rank_timing_all_compression( int cycles, MPI_Datatype sddt, void *sbuf, char *scomp,
+        void* rbuf, char *rcomp, int length, int comp_num )
+{
+    int outsize, do_size, done;
+    double timers[trials], comp_time[trials], decomp_time[trials], timer_keep;
+
+    MPI_Type_size(sddt, &outsize);
+
+    size_t compressed_size, decompressed_size;
+    int result;
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    int c = 0;
+    for( int t = 0; t < trials; t++ ){
+        size_t scomp_len = (size_t)length,
+               dcomp_len = (size_t)length * 2;
+
+        comp_time[t] = MPI_Wtime();
+        for( c = 0; c < cycles; c++ )
+            result = which_compression((unsigned char*)sbuf, outsize, (unsigned char**)&scomp, &scomp_len, comp_num);
+        comp_time[t] = (MPI_Wtime() - comp_time[t]) / cycles;
+        compressed_size = scomp_len;
+
+        c = 0;
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Send( &compressed_size, 1, MPI_LONG, 1, t*cycles+c, MPI_COMM_WORLD );
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        c = 0;
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Recv( &compressed_size, 1, MPI_LONG, 1, t*cycles+c+2, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        timers[t] = MPI_Wtime();
+        for( c = 0; c < cycles; c++ ){
+            MPI_Send( scomp, scomp_len, MPI_BYTE, 1, t*cycles+c+1, MPI_COMM_WORLD);
+            MPI_Recv( rbuf, compressed_size, MPI_BYTE, 1, t*cycles+c+3, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
+        }
+        timers[t] = (MPI_Wtime() - timers[t]) / cycles;
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        scomp_len = (size_t)length;
+        dcomp_len = (size_t)length * 2;
+        
+        decomp_time[t] = MPI_Wtime();
+        for( c = 0; c < cycles; c++ )
+            result = which_decompression((unsigned char*)rbuf, compressed_size, (unsigned char**)&rcomp, &dcomp_len, comp_num);
+        decomp_time[t] = (MPI_Wtime() - decomp_time[t]) / cycles;
+    }
+
+    MPI_Type_size(sddt, &outsize);
+    print_result(compressed_size, trials, comp_time);
+    print_result(compressed_size, trials, decomp_time);
+    print_result(compressed_size, trials, timers);
+    printf("\n");
+
+    return 0;
+}
+
+
+static int recv_rank_timing_all_compression( int cycles, MPI_Datatype sddt, void *sbuf, char *scomp,
+        void* rbuf, char *rcomp, int length, int comp_num )
+{
+    int do_size;
+    size_t compressed_size, decompressed_size;
+    int result;
+
+    MPI_Type_size( sddt, &do_size );
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    int done = 1;
+    int c = 0;
+    for( int t = 0; t < trials; t++ ){
+        size_t scomp_len = (size_t)length,
+               dcomp_len = (size_t)length * 2;
+
+        c = 0;
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Recv( &compressed_size, 1, MPI_LONG, 0, t*cycles+c, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        scomp_len = (size_t)length;
+        dcomp_len = (size_t)length * 2;
+
+        result = which_compression((unsigned char*)sbuf, do_size, (unsigned char**)&scomp, &scomp_len, comp_num);
+
+        c = 0;
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Send( &scomp_len, 1, MPI_LONG, 0, t*cycles+c+2, MPI_COMM_WORLD );
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        for( c = 0; c < cycles; c++ ){
+            MPI_Recv(rbuf, compressed_size, MPI_BYTE, 0, t*cycles+c+1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Send( scomp, scomp_len, MPI_BYTE, 0, t*cycles+c+3, MPI_COMM_WORLD );
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    return 0;
+}
+
+
+static int send_rank_compress_done( int cycles, MPI_Datatype sddt, void *sbuf, char *scomp, 
+        void* rbuf, char *rcomp, int length )
+{
+    int outsize, do_size, done;
+    double timers[trials], comp_time[trials], decomp_time[trials];
+
+    MPI_Type_size(sddt, &outsize);
+
+    size_t compressed_size, decompressed_size;
+    int result;
 
     size_t scomp_len = (size_t)length;
     result = compress_buffer((unsigned char*)sbuf, outsize, (unsigned char**)&scomp, &scomp_len);
-	
+
     MPI_Barrier(MPI_COMM_WORLD);
 
-	int c = 0;
-	for( int t = 0; t < trials; t++ ){
+    int c = 0;
+    for( int t = 0; t < trials; t++ ){
         size_t dcomp_len = (size_t)length * 2;
 
         timers[t] = MPI_Wtime();
 
         MPI_Send( &scomp_len, 1, MPI_LONG, 1, t*4+c, MPI_COMM_WORLD );
-		MPI_Send( scomp, scomp_len, MPI_BYTE, 1, t*4+c+1, MPI_COMM_WORLD);
+        MPI_Send( scomp, scomp_len, MPI_BYTE, 1, t*4+c+1, MPI_COMM_WORLD);
 
         dcomp_len = (size_t)length * 2;
 
@@ -464,90 +643,101 @@ static int send_rank_compress_done( int cycles, MPI_Datatype sddt, void *sbuf, c
         MPI_Recv( rbuf, compressed_size, MPI_BYTE, 1, t*4+c+3, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
         result = decompress_buffer(rbuf, compressed_size, (unsigned char**)&rcomp, &dcomp_len);
 
-		timers[t] = (MPI_Wtime() - timers[t]);
+        timers[t] = (MPI_Wtime() - timers[t]);
     }
 
-	MPI_Type_size(sddt, &outsize);
-	print_result(outsize, trials, timers);
+    MPI_Type_size(sddt, &outsize);
+    print_result(outsize, trials, timers);
 
-	return 0;
+    return 0;
 }
 
 
 static int recv_rank_compress_done( int cycles, MPI_Datatype sddt, void *sbuf, char *scomp, 
-		      void* rbuf, char *rcomp, int length )
+        void* rbuf, char *rcomp, int length )
 {
-	int do_size;
-	size_t compressed_size, decompressed_size;
-	int result;
-    
-	MPI_Type_size( sddt, &do_size );
+    int do_size;
+    size_t compressed_size, decompressed_size;
+    int result;
+
+    MPI_Type_size( sddt, &do_size );
     size_t scomp_len = (size_t)length;
     result = compress_buffer((unsigned char*)sbuf, do_size, (unsigned char**)&scomp, &scomp_len);
-    
-	MPI_Barrier(MPI_COMM_WORLD);
 
-	int done = 1;
-	int c = 0;
-	for( int t = 0; t < trials; t++ ){
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    int done = 1;
+    int c = 0;
+    for( int t = 0; t < trials; t++ ){
         size_t dcomp_len = (size_t)length * 2;
 
         MPI_Recv( &compressed_size, 1, MPI_LONG, 0, t*4+c, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
-		MPI_Recv(rbuf, compressed_size, MPI_BYTE, 0, t*4+c+1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-		result = decompress_buffer(rbuf, compressed_size, (unsigned char**)&rcomp, &dcomp_len);
+        MPI_Recv(rbuf, compressed_size, MPI_BYTE, 0, t*4+c+1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        result = decompress_buffer(rbuf, compressed_size, (unsigned char**)&rcomp, &dcomp_len);
 
         MPI_Send( &scomp_len, 1, MPI_LONG, 0, t*4+c+2, MPI_COMM_WORLD );
         MPI_Send( scomp, scomp_len, MPI_BYTE, 0, t*4+c+3, MPI_COMM_WORLD );
-	}
+    }
 
     return 0;
 }
 
 static int pingpong(int cycles, MPI_Datatype sddt, void *sbuf, char *scomp,
-		    void *rbuf, char *rcomp, int length, int rank)
+        void *rbuf, char *rcomp, int length, int rank)
 {
-	if ( rank == 0 ){
-		send_rank( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
-	} else if ( rank == 1 ){
-		recv_rank( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
-	}
-	return 0;
+    if ( rank == 0 ){
+        send_rank( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
+    } else if ( rank == 1 ){
+        recv_rank( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
+    }
+    return 0;
 }
 
 static int pingpong_compress_done(int cycles, MPI_Datatype sddt, void *sbuf, char *scomp,
-		    void *rbuf, char *rcomp, int length, int rank)
+        void *rbuf, char *rcomp, int length, int rank)
 {
-	if ( rank == 0 ){
-		send_rank_compress_done( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
-	} else if ( rank == 1 ){
-		recv_rank_compress_done( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
-	}
-	return 0;
+    if ( rank == 0 ){
+        send_rank_compress_done( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
+    } else if ( rank == 1 ){
+        recv_rank_compress_done( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
+    }
+    return 0;
 }
 
 static int pingpong_orig(int cycles, MPI_Datatype sddt, void *sbuf, void *rbuf, int rank)
 {
-	if ( rank == 0 ){
-		send_rank_orig( cycles, sddt, sbuf, rbuf );
-	} else if ( rank == 1 ){
-		recv_rank_orig( cycles, sddt, sbuf, rbuf );
-	}
-	return 0;
+    if ( rank == 0 ){
+        send_rank_orig( cycles, sddt, sbuf, rbuf );
+    } else if ( rank == 1 ){
+        recv_rank_orig( cycles, sddt, sbuf, rbuf );
+    }
+    return 0;
 }
 
 static int pingpong_timing(int cycles, MPI_Datatype sddt, void *sbuf, char *scomp,
-		    void *rbuf, char *rcomp, int length, int rank)
+        void *rbuf, char *rcomp, int length, int rank)
 {
-	if ( rank == 0 ){
-		send_rank_timing( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
-	} else if ( rank == 1 ){
-		recv_rank_timing( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
-	}
-	return 0;
+    if ( rank == 0 ){
+        send_rank_timing( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
+    } else if ( rank == 1 ){
+        recv_rank_timing( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
+    }
+    return 0;
+}
+
+static int pingpong_timing_all_compression(int cycles, MPI_Datatype sddt, void *sbuf, char *scomp,
+        void *rbuf, char *rcomp, int length, int rank, int comp_num)
+{
+    if ( rank == 0 ){
+        send_rank_timing_all_compression( cycles, sddt, sbuf, scomp, rbuf, rcomp, length, comp_num );
+    } else if ( rank == 1 ){
+        recv_rank_timing_all_compression( cycles, sddt, sbuf, scomp, rbuf, rcomp, length, comp_num );
+    }
+    return 0;
 }
 
 static void do_compression_test_only( int cycles, MPI_Datatype sddt, void *sbuf, char *scomp, 
-       void *rbuf, char *rcomp, int length )
+        void *rbuf, char *rcomp, int length, int num_comp )
 {
 
     double comp_time[trials], decomp_time[trials];
@@ -582,7 +772,8 @@ static void do_compression_test_only( int cycles, MPI_Datatype sddt, void *sbuf,
         comp_time[t] = MPI_Wtime();
         scomp_len = (size_t)ddt_size;
         for( int c = 0; c < cycles; c++ ){
-            compress_buffer((unsigned char*)sbuf, ddt_size, (unsigned char**)&scomp, &scomp_len);
+            //compress_buffer((unsigned char*)sbuf, ddt_size, (unsigned char**)&scomp, &scomp_len);
+            which_compression((unsigned char*)sbuf, ddt_size, (unsigned char**)&scomp, &scomp_len, num_comp);
         }
         comp_time[t] = (MPI_Wtime() - comp_time[t]) / cycles;
     }
@@ -593,7 +784,8 @@ static void do_compression_test_only( int cycles, MPI_Datatype sddt, void *sbuf,
         scomp_len = (size_t)ddt_size;
         for( int c = 0; c < cycles; c++ ){
             decomp_len = length * 2;
-            decompress_buffer(scomp, compressed_size, (unsigned char**)&rcomp, &decomp_len);
+            //decompress_buffer(scomp, compressed_size, (unsigned char**)&rcomp, &decomp_len);
+            which_decompression(scomp, compressed_size, (unsigned char**)&rcomp, &decomp_len, num_comp);
         }
         decomp_time[t] = (MPI_Wtime() - decomp_time[t]) / cycles;
     }
@@ -602,7 +794,6 @@ static void do_compression_test_only( int cycles, MPI_Datatype sddt, void *sbuf,
     print_result(ddt_size, trials, decomp_time);
 }
 
-#if 0
 static void do_lzo_compression_test_only( int cycles, MPI_Datatype sddt, void *sbuf, char *scomp,
         void *rbuf, char *rcomp, int length )
 {
@@ -644,22 +835,24 @@ static void do_lzo_compression_test_only( int cycles, MPI_Datatype sddt, void *s
         comp_time[t] = (MPI_Wtime() - comp_time[t]) / cycles;
     }
 
+    MPI_Barrier(MPI_COMM_WORLD);
+
     size_t compressed_size = scomp_len, decomp_len;
     for( int t = 0; t < trials; t++ ){
         decomp_time[t] = MPI_Wtime();
-        scomp_len = (size_t)ddt_size;
         for( int c = 0; c < cycles; c++ ){
             decomp_len = length * 2;
-            decompress_buffer(scomp, compressed_size, (unsigned char**)&rcomp, &decomp_len);
+            decompress_lzo_buffer((unsigned char*)scomp, scomp_len, (unsigned char**)&rcomp, &decomp_len);
         }
         decomp_time[t] = (MPI_Wtime() - decomp_time[t]) / cycles;
     }
-//    print_result(ddt_size, trials, comp_time);
-//    print_result(ddt_size, trials, decomp_time);
-}
-#endif
 
-static int do_test_for_ddt(int doop, MPI_Datatype sddt, MPI_Datatype rddt, int length)
+    print_result(ddt_size, trials, comp_time);
+    print_result(ddt_size, trials, decomp_time);
+}
+
+#define NUM_COMP 3
+static int do_test_for_ddt(int doop, MPI_Datatype sddt, MPI_Datatype rddt, int length, int gap)
 {
     MPI_Aint lb, extent;
     int *sbuf, *rbuf;
@@ -670,15 +863,13 @@ static int do_test_for_ddt(int doop, MPI_Datatype sddt, MPI_Datatype rddt, int l
     MPI_Type_size( sddt, &ddt_size );
 
     length = ddt_size;
-
     sbuf = (char *) malloc(length);
     rbuf = (char *) malloc(length);
-
     scomp = (char *)malloc( length*2 );
     rcomp = (char *)malloc( length*2 );
     for( int i = 0; i < ddt_size/sizeof(int); i++ ){
-        if( i % 4 == 0 ){
-            sbuf[i] = rand();
+        if( i % gap == 0 ){
+            sbuf[i] = i;
             rbuf[i] = sbuf[i];
         }
     }
@@ -686,8 +877,6 @@ static int do_test_for_ddt(int doop, MPI_Datatype sddt, MPI_Datatype rddt, int l
     size_t compressed_size, decompressed_size;
     int result;
     unsigned char *compressed_buffer, *decompressed_buffer;
-
-    //result = compress_buffer(sbuf, ddt_size, &compressed_buffer, &compressed_size);
 
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -697,18 +886,54 @@ static int do_test_for_ddt(int doop, MPI_Datatype sddt, MPI_Datatype rddt, int l
         MPI_Barrier(MPI_COMM_WORLD);
         pingpong_orig(cycles, sddt, (char*)sbuf, (char*)rbuf, rank);
         MPI_Barrier(MPI_COMM_WORLD);
-        pingpong(cycles, sddt, (char*)sbuf, scomp, (char*)rbuf, rcomp, length, rank);
-        MPI_Barrier(MPI_COMM_WORLD);
-        pingpong_compress_done(cycles, sddt, (char*)sbuf, scomp, (char*)rbuf, rcomp, length, rank);
-        MPI_Barrier(MPI_COMM_WORLD);
-        pingpong_timing(cycles, sddt, (char*)sbuf, scomp, (char*)rbuf, rcomp, length, rank);
-        MPI_Barrier(MPI_COMM_WORLD);
+        //pingpong(cycles, sddt, (char*)sbuf, scomp, (char*)rbuf, rcomp, length, rank);
+        //MPI_Barrier(MPI_COMM_WORLD);
+        //pingpong_compress_done(cycles, sddt, (char*)sbuf, scomp, (char*)rbuf, rcomp, length, rank);
+        //MPI_Barrier(MPI_COMM_WORLD);
+        //pingpong_timing(cycles, sddt, (char*)sbuf, scomp, (char*)rbuf, rcomp, length, rank);
+        //MPI_Barrier(MPI_COMM_WORLD);
+
+        for( int i = 0; i < NUM_COMP; i++ ){
+            if( rank == 0 ){
+                if( i == 0 )
+                    printf("! zlib\n");
+                if( i == 1 )
+                    printf("! lzo\n");
+                if( i == 2 )
+                    printf("! lz4\n");
+            }
+            MPI_Barrier(MPI_COMM_WORLD);
+            pingpong_timing_all_compression(cycles, sddt, (char*)sbuf, scomp, (char*)rbuf, rcomp, length, rank, i);
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+
+        if( rank == 0 )
+            printf("\n");
     }
 
     if( size == 1 ){
-        do_compression_test_only( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
-//        do_lzo_compression_test_only( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
+        for( int i = 0; i < NUM_COMP; i++ ){
+            if( i == 0 )
+                printf("! zlib\n");
+            if( i == 1 )
+                printf("! lzo\n");
+            if( i == 2 )
+                printf("! lz4\n");
+            do_compression_test_only( cycles, sddt, sbuf, scomp, rbuf, rcomp, length, i );
+            MPI_Barrier(MPI_COMM_WORLD);
+            //do_lzo_compression_test_only( cycles, sddt, sbuf, scomp, rbuf, rcomp, length );
+            printf("\n");
+        }
     }
+
+#if 0
+    if( rank == 0 ){
+        for( int i = 0; i < ddt_size; i++ ){
+            if( ((int*)sbuf)[i] != rcomp[i] )
+                printf("Verfication ERROR at position %d %d %d\n", i, ((int*)sbuf)[i], rcomp[i]);
+        }
+    }
+#endif
 
     free( scomp );
     free( rcomp );
@@ -728,15 +953,16 @@ int main(int argc, char *argv[])
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    int gap = atoi(argv[1]);
     if( rank == 0 && size == 2 ){
-	    printf("\n! MPI_Type_contiguous(x, DOUBLE)\n");
-	    printf("# Ping-pong \n");
+        printf("\n! MPI_Type_contiguous(x, DOUBLE), redenduncy %.f'%'\n", 1./gap*100);
+        printf("# Ping-pong \n");
     }
-    for( int i = 4096; i < 25600000; i+=4096 ){
-	    MPI_Type_contiguous( i, MPI_BYTE, &ddt );
-	    MPI_Type_commit( &ddt );
-	    do_test_for_ddt(run_tests, ddt, ddt, MAX_LENGTH);
-	    MPI_Type_free( &ddt );
+    for( int i = 64; i < 120000; i+=64 ){
+        MPI_Type_contiguous( i, MPI_BYTE, &ddt );
+        MPI_Type_commit( &ddt );
+        do_test_for_ddt(run_tests, ddt, ddt, MAX_LENGTH, gap);
+        MPI_Type_free( &ddt );
     }
 
     MPI_Finalize();
